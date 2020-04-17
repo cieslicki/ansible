@@ -27,6 +27,8 @@ import pwd
 import re
 import time
 
+from contextlib import contextmanager
+from distutils.version import LooseVersion
 from numbers import Number
 
 try:
@@ -43,18 +45,15 @@ from ansible.errors import AnsibleError, AnsibleFilterError, AnsibleUndefinedVar
 from ansible.module_utils.six import iteritems, string_types, text_type
 from ansible.module_utils._text import to_native, to_text, to_bytes
 from ansible.module_utils.common._collections_compat import Sequence, Mapping, MutableMapping
+from ansible.module_utils.common.collections import is_sequence
+from ansible.module_utils.compat.importlib import import_module
 from ansible.plugins.loader import filter_loader, lookup_loader, test_loader
 from ansible.template.safe_eval import safe_eval
 from ansible.template.template import AnsibleJ2Template
 from ansible.template.vars import AnsibleJ2Vars
+from ansible.utils.collection_loader import AnsibleCollectionRef
 from ansible.utils.display import Display
-from ansible.utils.unsafe_proxy import UnsafeProxy, wrap_var
-
-# HACK: keep Python 2.6 controller tests happy in CI until they're properly split
-try:
-    from importlib import import_module
-except ImportError:
-    import_module = __import__
+from ansible.utils.unsafe_proxy import wrap_var
 
 display = Display()
 
@@ -69,6 +68,8 @@ NON_TEMPLATED_TYPES = (bool, Number)
 
 JINJA2_OVERRIDE = '#jinja2:'
 
+from jinja2 import __version__ as j2_version
+
 USE_JINJA2_NATIVE = False
 if C.DEFAULT_JINJA2_NATIVE:
     try:
@@ -78,7 +79,6 @@ if C.DEFAULT_JINJA2_NATIVE:
     except ImportError:
         from jinja2 import Environment
         from jinja2.utils import concat as j2_concat
-        from jinja2 import __version__ as j2_version
         display.warning(
             'jinja2_native requires Jinja 2.10 and above. '
             'Version detected: %s. Falling back to default.' % j2_version
@@ -234,6 +234,10 @@ class AnsibleUndefined(StrictUndefined):
     rather than throwing an exception.
     '''
     def __getattr__(self, name):
+        if name == '__UNSAFE__':
+            # AnsibleUndefined should never be assumed to be unsafe
+            # This prevents ``hasattr(val, '__UNSAFE__')`` from evaluating to ``True``
+            raise AttributeError(name)
         # Return original Undefined object to preserve the first failure context
         return self
 
@@ -250,7 +254,7 @@ class AnsibleContext(Context):
     A custom context, which intercepts resolve() calls and sets a flag
     internally if any variable lookup returns an AnsibleUnsafe value. This
     flag is checked post-templating, and (when set) will result in the
-    final templated result being wrapped via UnsafeProxy.
+    final templated result being wrapped in AnsibleUnsafe.
     '''
     def __init__(self, *args, **kwargs):
         super(AnsibleContext, self).__init__(*args, **kwargs)
@@ -271,7 +275,7 @@ class AnsibleContext(Context):
             for item in val:
                 if self._is_unsafe(item):
                     return True
-        elif isinstance(val, string_types) and hasattr(val, '__UNSAFE__'):
+        elif getattr(val, '__UNSAFE__', False) is True:
             return True
         return False
 
@@ -292,6 +296,40 @@ class AnsibleContext(Context):
         val = super(AnsibleContext, self).resolve_or_missing(key)
         self._update_unsafe(val)
         return val
+
+    def get_all(self):
+        """Return the complete context as a dict including the exported
+        variables. For optimizations reasons this might not return an
+        actual copy so be careful with using it.
+
+        This is to prevent from running ``AnsibleJ2Vars`` through dict():
+
+            ``dict(self.parent, **self.vars)``
+
+        In Ansible this means that ALL variables would be templated in the
+        process of re-creating the parent because ``AnsibleJ2Vars`` templates
+        each variable in its ``__getitem__`` method. Instead we re-create the
+        parent via ``AnsibleJ2Vars.add_locals`` that creates a new
+        ``AnsibleJ2Vars`` copy without templating each variable.
+
+        This will prevent unnecessarily templating unused variables in cases
+        like setting a local variable and passing it to {% include %}
+        in a template.
+
+        Also see ``AnsibleJ2Template``and
+        https://github.com/pallets/jinja/commit/d67f0fd4cc2a4af08f51f4466150d49da7798729
+        """
+        if LooseVersion(j2_version) >= LooseVersion('2.9'):
+            if not self.vars:
+                return self.parent
+            if not self.parent:
+                return self.vars
+
+        if isinstance(self.parent, AnsibleJ2Vars):
+            return self.parent.add_locals(self.vars)
+        else:
+            # can this happen in Ansible?
+            return dict(self.parent, **self.vars)
 
 
 class JinjaPluginIntercept(MutableMapping):
@@ -325,35 +363,38 @@ class JinjaPluginIntercept(MutableMapping):
         if func:
             return func
 
-        components = key.split('.')
+        acr = AnsibleCollectionRef.try_parse_fqcr(key, self._dirname)
 
-        if len(components) != 3:
+        if not acr:
             raise KeyError('invalid plugin name: {0}'.format(key))
 
-        collection_name = '.'.join(components[0:2])
-        collection_pkg = 'ansible_collections.{0}.plugins.{1}'.format(collection_name, self._dirname)
+        try:
+            pkg = import_module(acr.n_python_package_name)
+        except ImportError:
+            raise KeyError()
 
-        # FIXME: error handling for bogus plugin name, bogus impl, bogus filter/test
+        parent_prefix = acr.collection
 
-        # FIXME: move this capability into the Jinja plugin loader
-        pkg = import_module(collection_pkg)
+        if acr.subdirs:
+            parent_prefix = '{0}.{1}'.format(parent_prefix, acr.subdirs)
 
-        for dummy, module_name, ispkg in pkgutil.iter_modules(pkg.__path__, prefix=collection_name + '.'):
+        for dummy, module_name, ispkg in pkgutil.iter_modules(pkg.__path__, prefix=parent_prefix + '.'):
             if ispkg:
                 continue
 
-            plugin_impl = self._pluginloader.get(module_name)
+            try:
+                plugin_impl = self._pluginloader.get(module_name)
+            except Exception as e:
+                raise TemplateSyntaxError(to_native(e), 0)
 
             method_map = getattr(plugin_impl, self._method_map_name)
 
             for f in iteritems(method_map()):
-                fq_name = '.'.join((collection_name, f[0]))
+                fq_name = '.'.join((parent_prefix, f[0]))
+                # FIXME: detect/warn on intra-collection function name collisions
                 self._collection_jinja_func_cache[fq_name] = f[1]
 
-            function_impl = self._collection_jinja_func_cache[key]
-
-        # FIXME: detect/warn on intra-collection function name collisions
-
+        function_impl = self._collection_jinja_func_cache[key]
         return function_impl
 
     def __setitem__(self, key, value):
@@ -500,8 +541,8 @@ class Templar:
         are being changed.
         '''
 
-        if not isinstance(variables, dict):
-            raise AnsibleAssertionError("the type of 'variables' should be a dict but was a %s" % (type(variables)))
+        if not isinstance(variables, Mapping):
+            raise AnsibleAssertionError("the type of 'variables' should be a Mapping but was a %s" % (type(variables)))
         self._available_variables = variables
         self._cached_result = {}
 
@@ -511,6 +552,36 @@ class Templar:
             version='2.13'
         )
         self.available_variables = variables
+
+    @contextmanager
+    def set_temporary_context(self, **kwargs):
+        """Context manager used to set temporary templating context, without having to worry about resetting
+        original values afterward
+
+        Use a keyword that maps to the attr you are setting. Applies to ``self.environment`` by default, to
+        set context on another object, it must be in ``mapping``.
+        """
+        mapping = {
+            'available_variables': self,
+            'searchpath': self.environment.loader,
+        }
+        original = {}
+
+        for key, value in kwargs.items():
+            obj = mapping.get(key, self.environment)
+            try:
+                original[key] = getattr(obj, key)
+                if value is not None:
+                    setattr(obj, key, value)
+            except AttributeError:
+                # Ignore invalid attrs, lstrip_blocks was added in jinja2==2.7
+                pass
+
+        yield
+
+        for key in original:
+            obj = mapping.get(key, self.environment)
+            setattr(obj, key, original[key])
 
     def template(self, variable, convert_bare=False, preserve_trailing_newlines=True, escape_backslashes=True, fail_on_undefined=None, overrides=None,
                  convert_data=True, static_vars=None, cache=True, disable_lookups=False):
@@ -592,12 +663,12 @@ class Templar:
                         # we only cache in the case where we have a single variable
                         # name, to make sure we're not putting things which may otherwise
                         # be dynamic in the cache (filters, lookups, etc.)
-                        if cache:
+                        if cache and only_one:
                             self._cached_result[sha1_hash] = result
 
                 return result
 
-            elif isinstance(variable, (list, tuple)):
+            elif is_sequence(variable):
                 return [self.template(
                     v,
                     preserve_trailing_newlines=preserve_trailing_newlines,
@@ -605,7 +676,7 @@ class Templar:
                     overrides=overrides,
                     disable_lookups=disable_lookups,
                 ) for v in variable]
-            elif isinstance(variable, (dict, Mapping)):
+            elif isinstance(variable, Mapping):
                 d = {}
                 # we don't use iteritems() here to avoid problems if the underlying dict
                 # changes sizes due to the templating, which can happen with hostvars
@@ -713,7 +784,7 @@ class Templar:
         return self._lookup(name, *args, **kwargs)
 
     def _lookup(self, name, *args, **kwargs):
-        instance = self._lookup_loader.get(name.lower(), loader=self._loader, templar=self)
+        instance = self._lookup_loader.get(name, loader=self._loader, templar=self)
 
         if instance is not None:
             wantlist = kwargs.pop('wantlist', False)
@@ -744,7 +815,7 @@ class Templar:
                     ran = wrap_var(ran)
                 else:
                     try:
-                        ran = UnsafeProxy(",".join(ran))
+                        ran = wrap_var(",".join(ran))
                     except TypeError:
                         # Lookup Plugins should always return lists.  Throw an error if that's not
                         # the case:

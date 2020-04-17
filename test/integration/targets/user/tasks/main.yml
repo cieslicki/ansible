@@ -55,6 +55,46 @@
       - user_test0_1 is not changed
       - '"ansibulluser" in user_names.stdout_lines'
 
+# create system user
+
+- name: remove user
+  user:
+    name: ansibulluser
+    state: absent
+
+- name: create system user
+  user:
+    name: ansibulluser
+    state: present
+    system: yes
+
+# test adding user with uid
+# https://github.com/ansible/ansible/issues/62969
+- name: remove the test user
+  user:
+    name: ansibulluser
+    state: absent
+
+- name: try to create a user with uid
+  user:
+    name: ansibulluser
+    state: present
+    uid: 572
+  register: user_test01_0
+
+- name: create the user again
+  user:
+    name: ansibulluser
+    state: present
+    uid: 572
+  register: user_test01_1
+
+- name: validate results for testcase 0
+  assert:
+    that:
+      - user_test01_0 is changed
+      - user_test01_1 is not changed
+
 # test user add with password
 - name: add an encrypted password for user
   user:
@@ -67,6 +107,32 @@
 - name: there should not be warnings
   assert:
     that: "'warnings' not in test_user_encrypt0"
+
+# https://github.com/ansible/ansible/issues/65711
+- name: Test updating password only on creation
+  user:
+    name: ansibulluser
+    password: '*'
+    update_password: on_create
+  register: test_user_update_password
+
+- name: Ensure password was not changed
+  assert:
+    that:
+      - test_user_update_password is not changed
+
+- name: Verify password hash for Linux
+  when: ansible_facts.os_family in ['RedHat', 'Debian', 'Suse']
+  block:
+    - name: LINUX | Get shadow entry for ansibulluser
+      getent:
+        database: shadow
+        key: ansibulluser
+
+    - name: LINUX | Ensure password hash was not removed
+      assert:
+        that:
+          - getent_shadow['ansibulluser'][1] != '*'
 
 - block:
     - name: add an plaintext password for user
@@ -105,11 +171,18 @@
         password: '*'
       register: test_user_encrypt4
 
-    - name: there should be no warnings when setting the password to '!' and '*'
+    - name: change password to '*************'
+      user:
+        name: ansibulluser
+        password: '*************'
+      register: test_user_encrypt5
+
+    - name: there should be no warnings when setting the password to '!',  '*' or '*************'
       assert:
         that:
           - "'warnings' not in test_user_encrypt3"
           - "'warnings' not in test_user_encrypt4"
+          - "'warnings' not in test_user_encrypt5"
   when: ansible_facts.system != 'Darwin'
 
 
@@ -195,6 +268,22 @@
   file:
     path: "{{ user_home_prefix[ansible_facts.system] }}/in2deep/"
     state: absent
+
+
+# https://github.com/ansible/ansible/issues/60307
+# Make sure we can create a user when the home directory is missing
+- name: Create user with home path that does not exist
+  user:
+    name: ansibulluser3
+    state: present
+    home: "{{ user_home_prefix[ansible_facts.system] }}/nosuchdir"
+    createhome: no
+
+- name: Cleanup test account
+  user:
+    name: ansibulluser3
+    state: absent
+    remove: yes
 
 
 ## user check
@@ -713,6 +802,7 @@
     name: ansibulluser
     state: present
     generate_ssh_key: yes
+    force: yes
     ssh_key_file: "{{ output_dir }}/test_id_rsa"
     ssh_key_passphrase: secret_passphrase
 
@@ -872,6 +962,14 @@
   tags:
     - user_test_local_mode
 
+- name: Create local account that already exists to check for warning
+  user:
+    name: root
+    local: yes
+  register: local_existing
+  tags:
+    - user_test_local_mode
+
 - name: Create local_ansibulluser
   user:
     name: local_ansibulluser
@@ -910,9 +1008,14 @@
   tags:
     - user_test_local_mode
 
-- name: Create test group
+- name: Create test groups
   group:
-    name: testgroup
+    name: "{{ item }}"
+  loop:
+    - testgroup1
+    - testgroup2
+    - testgroup3
+    - testgroup4
   tags:
     - user_test_local_mode
 
@@ -921,7 +1024,7 @@
     name: local_ansibulluser
     state: present
     local: yes
-    groups: testgroup
+    groups: ['testgroup1', 'testgroup2']
   register: local_user_test_3
   ignore_errors: yes
   tags:
@@ -932,9 +1035,41 @@
     name: local_ansibulluser
     state: present
     local: yes
+    groups: ['testgroup3', 'testgroup4']
     append: yes
   register: local_user_test_4
   ignore_errors: yes
+  tags:
+    - user_test_local_mode
+
+- name: Test append without groups for local_ansibulluser
+  user:
+    name: local_ansibulluser
+    state: present
+    append: yes
+  register: local_user_test_5
+  ignore_errors: yes
+  tags:
+    - user_test_local_mode
+
+- name: Remove local_ansibulluser again
+  user:
+    name: local_ansibulluser
+    state: absent
+    remove: yes
+    local: yes
+  tags:
+    - user_test_local_mode
+
+- name: Remove test groups
+  group:
+    name: "{{ item }}"
+    state: absent
+  loop:
+    - testgroup1
+    - testgroup2
+    - testgroup3
+    - testgroup4
   tags:
     - user_test_local_mode
 
@@ -943,19 +1078,20 @@
     that:
       - local_user_test_1 is changed
       - local_user_test_2 is not changed
-      - local_user_test_3 is failed
-      - "local_user_test_3['msg'] is search('parameters are mutually exclusive: groups|local')"
-      - local_user_test_4 is failed
-      - "local_user_test_4['msg'] is search('parameters are mutually exclusive: groups|append')"
+      - local_user_test_3 is changed
+      - local_user_test_4 is changed
       - local_user_test_remove_1 is changed
       - local_user_test_remove_2 is not changed
   tags:
     - user_test_local_mode
 
-- name: Ensure warnings were displayed
+- name: Ensure warnings were displayed properly
   assert:
     that:
       - local_user_test_1['warnings'] | length > 0
-      - "'user was not found in /etc/passwd. The local user account may already exist if the local account
-        database exists somewhere other than /etc/passwd.' in local_user_test_1['warnings'][0]"
+      - local_user_test_1['warnings'] | first is search('The local user account may already exist')
+      - local_user_test_5['warnings'] is search("'append' is set, but no 'groups' are specified. Use 'groups'")
+      - local_existing['warnings'] is not defined
   when: ansible_facts.system in ['Linux']
+  tags:
+    - user_test_local_mode

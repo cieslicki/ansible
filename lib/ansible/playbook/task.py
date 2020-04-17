@@ -36,6 +36,7 @@ from ansible.playbook.conditional import Conditional
 from ansible.playbook.loop_control import LoopControl
 from ansible.playbook.role import Role
 from ansible.playbook.taggable import Taggable
+from ansible.utils.collection_loader import AnsibleCollectionLoader
 from ansible.utils.display import Display
 from ansible.utils.sentinel import Sentinel
 
@@ -110,16 +111,19 @@ class Task(Base, Conditional, Taggable, CollectionSearch):
             path = "%s:%s" % (self._parent._play._ds._data_source, self._parent._play._ds._line_number)
         return path
 
-    def get_name(self):
+    def get_name(self, include_role_fqcn=True):
         ''' return the name of the task '''
 
-        if self._role and self.name and ("%s : " % self._role._role_name) not in self.name:
-            return "%s : %s" % (self._role.get_name(), self.name)
+        if self._role:
+            role_name = self._role.get_name(include_role_fqcn=include_role_fqcn)
+
+        if self._role and self.name and role_name not in self.name:
+            return "%s : %s" % (role_name, self.name)
         elif self.name:
             return self.name
         else:
             if self._role:
-                return "%s : %s" % (self._role.get_name(), self.action)
+                return "%s : %s" % (role_name, self.action)
             else:
                 return "%s" % (self.action,)
 
@@ -177,10 +181,35 @@ class Task(Base, Conditional, Taggable, CollectionSearch):
         if isinstance(ds, AnsibleBaseYAMLObject):
             new_ds.ansible_pos = ds.ansible_pos
 
+        # since this affects the task action parsing, we have to resolve in preprocess instead of in typical validator
+        default_collection = AnsibleCollectionLoader().default_collection
+
+        # use the parent value if our ds doesn't define it
+        collections_list = ds.get('collections', self.collections)
+
+        if collections_list is None:
+            collections_list = []
+
+        if isinstance(collections_list, string_types):
+            collections_list = [collections_list]
+
+        if default_collection and not self._role:  # FIXME: and not a collections role
+            if collections_list:
+                if default_collection not in collections_list:
+                    collections_list.insert(0, default_collection)
+            else:
+                collections_list = [default_collection]
+
+        if collections_list and 'ansible.builtin' not in collections_list and 'ansible.legacy' not in collections_list:
+            collections_list.append('ansible.legacy')
+
+        if collections_list:
+            ds['collections'] = collections_list
+
         # use the args parsing class to determine the action, args,
         # and the delegate_to value from the various possible forms
         # supported as legacy
-        args_parser = ModuleArgsParser(task_ds=ds, collection_list=self.collections)
+        args_parser = ModuleArgsParser(task_ds=ds, collection_list=collections_list)
         try:
             (action, args, delegate_to) = args_parser.parse()
         except AnsibleParserError as e:
@@ -263,6 +292,9 @@ class Task(Base, Conditional, Taggable, CollectionSearch):
 
         if self._parent:
             self._parent.post_validate(templar)
+
+        if AnsibleCollectionLoader().default_collection:
+            pass
 
         super(Task, self).post_validate(templar)
 

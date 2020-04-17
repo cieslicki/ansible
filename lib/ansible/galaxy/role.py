@@ -33,10 +33,10 @@ from shutil import rmtree
 
 from ansible import context
 from ansible.errors import AnsibleError
+from ansible.galaxy.user_agent import user_agent
 from ansible.module_utils._text import to_native, to_text
 from ansible.module_utils.urls import open_url
 from ansible.playbook.role.requirement import RoleRequirement
-from ansible.galaxy.api import GalaxyAPI
 from ansible.utils.display import Display
 
 display = Display()
@@ -49,7 +49,7 @@ class GalaxyRole(object):
     META_INSTALL = os.path.join('meta', '.galaxy_install_info')
     ROLE_DIRS = ('defaults', 'files', 'handlers', 'meta', 'tasks', 'templates', 'vars', 'tests')
 
-    def __init__(self, galaxy, name, src=None, version=None, scm=None, path=None):
+    def __init__(self, galaxy, api, name, src=None, version=None, scm=None, path=None):
 
         self._metadata = None
         self._install_info = None
@@ -58,22 +58,31 @@ class GalaxyRole(object):
         display.debug('Validate TLS certificates: %s' % self._validate_certs)
 
         self.galaxy = galaxy
+        self.api = api
 
         self.name = name
         self.version = version
         self.src = src or name
         self.scm = scm
+        self.paths = [os.path.join(x, self.name) for x in galaxy.roles_paths]
 
         if path is not None:
-            if self.name not in path:
+            if not path.endswith(os.path.join(os.path.sep, self.name)):
                 path = os.path.join(path, self.name)
+            else:
+                # Look for a meta/main.ya?ml inside the potential role dir in case
+                #  the role name is the same as parent directory of the role.
+                #
+                # Example:
+                #   ./roles/testing/testing/meta/main.yml
+                for meta_main in self.META_MAIN:
+                    if os.path.exists(os.path.join(path, name, meta_main)):
+                        path = os.path.join(path, self.name)
+                        break
             self.path = path
         else:
             # use the first path by default
             self.path = os.path.join(galaxy.roles_paths[0], self.name)
-            # create list of possible paths
-            self.paths = [x for x in galaxy.roles_paths]
-            self.paths = [os.path.join(x, self.name) for x in self.paths]
 
     def __repr__(self):
         """
@@ -94,17 +103,17 @@ class GalaxyRole(object):
         Returns role metadata
         """
         if self._metadata is None:
-            for meta_main in self.META_MAIN:
-                meta_path = os.path.join(self.path, meta_main)
-                if os.path.isfile(meta_path):
-                    try:
-                        f = open(meta_path, 'r')
-                        self._metadata = yaml.safe_load(f)
-                    except Exception:
-                        display.vvvvv("Unable to load metadata for %s" % self.name)
-                        return False
-                    finally:
-                        f.close()
+            for path in self.paths:
+                for meta_main in self.META_MAIN:
+                    meta_path = os.path.join(path, meta_main)
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, 'r') as f:
+                                self._metadata = yaml.safe_load(f)
+                        except Exception:
+                            display.vvvvv("Unable to load metadata for %s" % self.name)
+                            return False
+                        break
 
         return self._metadata
 
@@ -126,6 +135,14 @@ class GalaxyRole(object):
                 finally:
                     f.close()
         return self._install_info
+
+    @property
+    def _exists(self):
+        for path in self.paths:
+            if os.path.isdir(path):
+                return True
+
+        return False
 
     def _write_galaxy_install_info(self):
         """
@@ -179,7 +196,7 @@ class GalaxyRole(object):
             display.display("- downloading role from %s" % archive_url)
 
             try:
-                url_file = open_url(archive_url, validate_certs=self._validate_certs)
+                url_file = open_url(archive_url, validate_certs=self._validate_certs, http_agent=user_agent())
                 temp_file = tempfile.NamedTemporaryFile(delete=False)
                 data = url_file.read()
                 while data:
@@ -204,17 +221,16 @@ class GalaxyRole(object):
                 role_data = self.src
                 tmp_file = self.fetch(role_data)
             else:
-                api = GalaxyAPI(self.galaxy)
-                role_data = api.lookup_role_by_name(self.src)
+                role_data = self.api.lookup_role_by_name(self.src)
                 if not role_data:
-                    raise AnsibleError("- sorry, %s was not found on %s." % (self.src, api.api_server))
+                    raise AnsibleError("- sorry, %s was not found on %s." % (self.src, self.api.api_server))
 
                 if role_data.get('role_type') == 'APP':
                     # Container Role
                     display.warning("%s is a Container App role, and should only be installed using Ansible "
                                     "Container" % self.name)
 
-                role_versions = api.fetch_role_related('versions', role_data['id'])
+                role_versions = self.api.fetch_role_related('versions', role_data['id'])
                 if not self.version:
                     # convert the version names to LooseVersion objects
                     # and sort them to get the latest version. If there

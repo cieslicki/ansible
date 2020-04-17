@@ -72,6 +72,8 @@ options:
   extra_opts:
     description:
       - Specify additional options by passing in an array.
+      - Each space-separated command-line option should be a new element of the array. See examples.
+      - Command-line options with multiple elements must use multiple lines in the array, one for each element.
     type: list
     default: ""
     version_added: "2.1"
@@ -97,7 +99,7 @@ todo:
     - Re-implement tar support using native tarfile module.
     - Re-implement zip support using native zipfile module.
 notes:
-    - Requires C(gtar)/C(unzip) command on target host.
+    - Requires C(zipinfo) and C(gtar)/C(unzip) command on target host.
     - Can handle I(.zip) files using C(unzip) as well as I(.tar), I(.tar.gz), I(.tar.bz2) and I(.tar.xz) files using C(gtar).
     - Does not handle I(.gz) files, I(.bz2) files or I(.xz) files that do not contain a I(.tar) archive.
     - Uses gtar's C(--diff) arg to calculate if changed or not. If this C(arg) is not
@@ -774,7 +776,7 @@ class TgzArchive(object):
             return False, 'Command "%s" could not handle archive.' % self.cmd_path
         # Errors and no files in archive assume that we weren't able to
         # properly unarchive it
-        return False, 'Command "%s" found no files in archive.' % self.cmd_path
+        return False, 'Command "%s" found no files in archive. Empty archive files are not supported.' % self.cmd_path
 
 
 # Class to handle tar files that aren't compressed
